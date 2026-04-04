@@ -180,6 +180,24 @@ def build_client() -> discord.Client:
         except Exception as e:
             await interaction.response.send_message(f'Error: {e}', ephemeral=True)
 
+    @tree.command(name='help', description='Show how to use the bot')
+    async def help_command(interaction: discord.Interaction):
+        text = (
+            "**Project & Task Bot**\n\n"
+            "Just talk to me naturally — I'll figure out what to do.\n\n"
+            "**Examples:**\n"
+            "• `Create a project called Website Redesign`\n"
+            "• `Add a task to write the homepage copy`\n"
+            "• `Mark task 3 as done`\n"
+            "• `What are my open tasks?`\n"
+            "• `Show tasks for Website Redesign`\n\n"
+            "**Slash commands:**\n"
+            "• `/authorize @user` — grant a user access (admins only)\n"
+            "• `/add_collaborator @user <project>` — add someone to a project\n"
+            "• `/link_project <project>` — link this channel to a project so tasks land here by default\n"
+        )
+        await interaction.response.send_message(text, ephemeral=True)
+
     return client
 
 
