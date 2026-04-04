@@ -66,7 +66,7 @@ def build_client() -> discord.Client:
     @client.event
     async def on_ready():
         await tree.sync()
-        print(f'Bot ready: {client.user} (ID: {client.user.id})')
+        print(f'Bot ready: {client.user} (ID: {client.user.id})', flush=True)
 
     @client.event
     async def on_message(message: discord.Message):
