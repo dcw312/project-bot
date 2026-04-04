@@ -65,7 +65,15 @@ def build_client() -> discord.Client:
 
     @client.event
     async def on_ready():
-        await tree.sync()
+        guild_id = os.environ.get('DISCORD_GUILD_ID')
+        if guild_id:
+            guild = discord.Object(id=int(guild_id))
+            tree.copy_global_to(guild=guild)
+            await tree.sync(guild=guild)
+            print(f'Slash commands synced to guild {guild_id} (instant)', flush=True)
+        else:
+            await tree.sync()
+            print('Slash commands synced globally (may take up to 1 hour)', flush=True)
         print(f'Bot ready: {client.user} (ID: {client.user.id})', flush=True)
 
     @client.event
