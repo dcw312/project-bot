@@ -48,9 +48,15 @@ def validate_ollama_startup():
 
 
 def build_messages(user_message: str, context_summary: str) -> list[dict]:
-    system_content = _system_prompt + "\n\n## Current context\n" + context_summary
+    system_content = (
+        _system_prompt
+        + "\n\n## Current context\n"
+        + context_summary
+        + '\n\nUnderstood? Reply only with: {"action":"no_op","data":{},"message":"Ready."}'
+    )
     return [
-        {"role": "system", "content": system_content},
+        {"role": "user", "content": system_content},
+        {"role": "assistant", "content": '{"action":"no_op","data":{},"message":"Ready."}'},
         {"role": "user", "content": user_message},
     ]
 
