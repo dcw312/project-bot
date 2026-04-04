@@ -44,6 +44,3 @@ data: { "project_name": "string (optional)" }
 No database action required. Reply conversationally.
 data: {}
 
-## Current context
-
-(The current user's projects and open tasks will be appended here at runtime.)

@@ -47,35 +47,34 @@ def validate_ollama_startup():
     _system_prompt = SYSTEM_PROMPT_PATH.read_text(encoding='utf-8')
 
 
-def build_messages(user_message: str, context_summary: str) -> list[dict]:
-    system_content = (
+def build_prompt(user_message: str, context_summary: str) -> str:
+    return (
         _system_prompt
         + "\n\n## Current context\n"
         + context_summary
-        + '\n\nUnderstood? Reply only with: {"action":"no_op","data":{},"message":"Ready."}'
+        + "\n\nUser: "
+        + user_message
+        + "\nAssistant:"
     )
-    return [
-        {"role": "user", "content": system_content},
-        {"role": "assistant", "content": '{"action":"no_op","data":{},"message":"Ready."}'},
-        {"role": "user", "content": user_message},
-    ]
 
 
 def chat(user_message: str, context_summary: str) -> tuple[dict, int]:
-    messages = build_messages(user_message, context_summary)
+    prompt = build_prompt(user_message, context_summary)
     start = time.monotonic()
     try:
         response = requests.post(
-            f"{OLLAMA_BASE_URL}/api/chat",
-            json={"model": OLLAMA_MODEL, "messages": messages, "stream": False},
+            f"{OLLAMA_BASE_URL}/api/generate",
+            json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False},
             timeout=120,
         )
         response.raise_for_status()
     except requests.RequestException as e:
-        raise OllamaUnavailableError(f"Ollama chat request failed: {e}")
+        raise OllamaUnavailableError(f"Ollama request failed: {e}")
 
     elapsed_ms = int((time.monotonic() - start) * 1000)
-    return response.json(), elapsed_ms
+    # Normalise generate response to match the shape services.py expects
+    data = response.json()
+    return {"message": {"content": data.get("response", "")}}, elapsed_ms
 
 
 def parse_llm_response(raw_content: str) -> dict:
