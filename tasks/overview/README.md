@@ -18,16 +18,37 @@ Do NOT implement any system command execution (no shell, SSH, etc). This is stri
 
 **Components:**
 
-- Discord bot (Python)
-- Django backend (API + ORM + admin)
+- Django backend (ORM + admin + service layer)
+- Discord bot — runs as a Django management command (`python manage.py run_bot`), makes direct Python calls into Django services (no HTTP)
 - Ollama LLM integration
 - Postgres database
 
 **Flow:**
 
 ```
-Discord → Bot → Django API → Ollama → Django (tool execution) → Response → Discord
+Discord → Bot (management command) → Django services (direct call) → Ollama → Django ORM → Response → Discord
 ```
+
+The bot lives inside the Django project and imports service functions directly. There is no internal HTTP round-trip. Django admin and the REST API (if kept) serve as optional interfaces — not required by the bot.
+
+**Running the system:**
+
+```
+# Terminal 1 — Django dev server (admin + optional API)
+python manage.py runserver
+
+# Terminal 2 — Discord bot
+python manage.py run_bot
+```
+
+## 🔑 Authorization
+
+Access to the bot is restricted to authorized Discord users.
+
+- **Admins** are defined as a comma-separated list of Discord user IDs in `.env` (`DISCORD_ADMIN_IDS`). They are never stored in the database — the env var is the source of truth.
+- **Authorized users** are stored in the database (`DiscordUser.is_authorized`). Only admins can authorize users via the slash command `/authorize @user`.
+- Messages from unauthorized users are silently ignored.
+- When a user is first authorized, a **Miscellaneous** project is automatically created for them. This is the default project for unscoped tasks.
 
 ## 🗃️ Data Model (Django)
 
@@ -36,12 +57,21 @@ Implement the following models:
 **DiscordUser**
 - `discord_id` (string, unique)
 - `username` (string)
+- `is_authorized` (bool, default False)
+- `authorized_at` (datetime, optional)
+- `created_at`
 
 **Project**
 - `name` (string)
 - `description` (text, optional)
-- `owner` (FK to DiscordUser)
+- `creator` (FK to DiscordUser, immutable)
+- `discord_channel_id` (string, optional) — links this project to a Discord channel
 - `created_at`
+
+**ProjectMember**
+- `project` (FK)
+- `user` (FK to DiscordUser)
+- `role` (owner, collaborator)
 
 **Task**
 - `project` (FK)
@@ -50,12 +80,21 @@ Implement the following models:
 - `status` (todo, doing, done)
 - `priority` (int, default 3)
 - `due_date` (datetime, optional)
+- `deadline_type` (hard, soft)
 - `created_at`
 
-**Activity**
+**Activity** *(user-facing — records task/project change events)*
 - `user` (FK)
 - `action` (string)
 - `payload` (JSON)
+- `created_at`
+
+**MessageLog** *(internal/debug — raw Discord messages and LLM responses)*
+- `user` (FK)
+- `discord_channel_id` (string)
+- `message` (text)
+- `llm_response` (JSON)
+- `elapsed_ms` (int)
 - `created_at`
 
 Register all models in Django admin.
@@ -109,37 +148,23 @@ Instead, it returns structured JSON describing an action.
 - Return user-friendly message
 - Reject malformed or unsafe responses
 
-## 🌐 API Design
-
-**Endpoint:** `POST /api/chat/`
-
-**Request:**
-
-```json
-{
-  "discord_id": "…",
-  "username": "…",
-  "message": "…"
-}
-```
-
-**Response:**
-
-```json
-{
-  "message": "…",
-  "data": {"…optional structured data…"}
-}
-```
-
 ## 🤖 Discord Bot
+
+Runs as a Django management command (`manage.py run_bot`).
 
 Requirements:
 
-- Use slash commands or message listener
-- Forward user message to Django API
+- Listen to all messages in all channels
+- Ignore messages from unauthorized users silently
+- Ignore messages that start with a mention of another user (not the bot)
+- Call Django service functions directly (no HTTP)
 - Display response message
-- No business logic in bot
+- No business logic in the bot — delegate everything to the service layer
+
+**Slash commands:**
+- `/authorize @user` — admin only, authorizes a Discord user
+- `/add_collaborator @user <project>` — adds a collaborator to a project
+- `/link_project <project>` — links the current channel to a project
 
 ## 🧠 System Prompt Requirements
 
@@ -165,22 +190,21 @@ Produce:
 
 - Django project with:
   - `models.py`
-  - serializers (or validation layer)
-  - API view for `/api/chat/`
+  - `services.py` — business logic callable by the bot directly
+  - validation layer for LLM output
   - admin setup
+- `management/commands/run_bot.py` — Discord bot as a management command
 - Ollama integration module
-- Discord bot script
 - Example system prompt builder
 - Example LLM response parser
 - README with:
   - setup instructions
   - how to run Ollama
-  - how to run bot + server
+  - how to run bot + Django admin
 
 ## ⚡ Non-goals (do NOT implement)
 
-- Authentication beyond Discord ID
-- Complex permissions
+- Complex role-based permissions beyond owner/collaborator
 - Background workers
 - UI frontend
 - Deployment configs
