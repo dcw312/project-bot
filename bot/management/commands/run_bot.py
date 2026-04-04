@@ -123,10 +123,10 @@ def build_client() -> discord.Client:
             await interaction.response.send_message('You do not have permission to do this.', ephemeral=True)
             return
         try:
-            discord_user, created = services.authorize_user(
-                str(interaction.user.id),
-                str(user.id),
-                str(user.name),
+            loop = asyncio.get_event_loop()
+            discord_user, created = await loop.run_in_executor(
+                None, services.authorize_user,
+                str(interaction.user.id), str(user.id), str(user.name),
             )
             status = 'authorized' if created else 'already existed and has been authorized'
             await interaction.response.send_message(
@@ -140,9 +140,14 @@ def build_client() -> discord.Client:
     async def add_collaborator(interaction: discord.Interaction, user: discord.Member, project: str):
         try:
             from bot.models import DiscordUser
-            actor = DiscordUser.objects.get(discord_id=str(interaction.user.id))
-            target = DiscordUser.objects.get(discord_id=str(user.id))
-            services.add_collaborator(actor, project, target)
+            loop = asyncio.get_event_loop()
+
+            def _run():
+                actor = DiscordUser.objects.get(discord_id=str(interaction.user.id))
+                target = DiscordUser.objects.get(discord_id=str(user.id))
+                services.add_collaborator(actor, project, target)
+
+            await loop.run_in_executor(None, _run)
             await interaction.response.send_message(
                 f'{user.mention} added to project "{project}".', ephemeral=True
             )
@@ -158,8 +163,13 @@ def build_client() -> discord.Client:
     async def link_project(interaction: discord.Interaction, project: str):
         try:
             from bot.models import DiscordUser
-            actor = DiscordUser.objects.get(discord_id=str(interaction.user.id))
-            services.link_channel_to_project(actor, project, str(interaction.channel_id))
+            loop = asyncio.get_event_loop()
+
+            def _run():
+                actor = DiscordUser.objects.get(discord_id=str(interaction.user.id))
+                services.link_channel_to_project(actor, project, str(interaction.channel_id))
+
+            await loop.run_in_executor(None, _run)
             await interaction.response.send_message(
                 f'This channel is now linked to project "{project}".', ephemeral=True
             )
