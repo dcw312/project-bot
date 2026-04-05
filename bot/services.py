@@ -323,28 +323,34 @@ def process_message(discord_id: str, username: str, message_text: str, channel_i
     }
 
     start = time.monotonic()
-    raw_response, elapsed_ms = ollama_client.chat(message_text, tool_handlers)
+    raw_response, elapsed_ms, tool_trace = ollama_client.chat(message_text, tool_handlers)
     raw_content = raw_response['message']['content']
 
     try:
         action_dict = ollama_client.parse_llm_response(raw_content)
     except ollama_client.LLMResponseParseError as e:
+        log_payload = {'error': str(e), 'raw': raw_content}
+        if tool_trace:
+            log_payload['tool_calls'] = tool_trace
         MessageLog.objects.create(
             user=user,
             discord_channel_id=channel_id,
             message=message_text,
-            llm_response={'error': str(e), 'raw': raw_content},
+            llm_response=log_payload,
             elapsed_ms=elapsed_ms,
         )
         return "Sorry, I had trouble understanding the response from the AI.", False
 
     response_text = handle_llm_action(user, action_dict, channel_id)
 
+    log_payload = dict(action_dict)
+    if tool_trace:
+        log_payload['tool_calls'] = tool_trace
     MessageLog.objects.create(
         user=user,
         discord_channel_id=channel_id,
         message=message_text,
-        llm_response=action_dict,
+        llm_response=log_payload,
         elapsed_ms=elapsed_ms,
     )
 

@@ -112,11 +112,12 @@ class ToolCallLoopTests(SimpleTestCase):
         """Model returns JSON action in content on the first request."""
         mock_post.return_value = _make_response({"message": _final_msg(_NO_OP_JSON)})
 
-        response, elapsed_ms = chat("hello", STUB_HANDLERS)
+        response, elapsed_ms, tool_trace = chat("hello", STUB_HANDLERS)
 
         self.assertEqual(response["message"]["content"], _NO_OP_JSON)
         self.assertIsInstance(elapsed_ms, int)
         mock_post.assert_called_once()
+        self.assertEqual(tool_trace, [])  # no tool calls made
 
     # 2. Single data tool call
     @patch("bot.ollama_client.requests.post")
@@ -127,10 +128,13 @@ class ToolCallLoopTests(SimpleTestCase):
             _make_response({"message": _final_msg(_LIST_TASKS_JSON)}),
         ]
 
-        response, _ = chat("list my tasks", STUB_HANDLERS)
+        response, _, tool_trace = chat("list my tasks", STUB_HANDLERS)
 
         self.assertEqual(response["message"]["content"], _LIST_TASKS_JSON)
         self.assertEqual(mock_post.call_count, 2)
+        self.assertEqual(len(tool_trace), 1)
+        self.assertEqual(tool_trace[0]["tool"], "get_projects")
+        self.assertEqual(tool_trace[0]["result"], _PROJECTS_JSON)
 
     # 3. Multi-turn data tool calls
     @patch("bot.ollama_client.requests.post")
@@ -142,7 +146,7 @@ class ToolCallLoopTests(SimpleTestCase):
             _make_response({"message": _final_msg(_ADD_TASK_JSON)}),
         ]
 
-        response, _ = chat("add a task to Website Redesign", STUB_HANDLERS)
+        response, _, tool_trace = chat("add a task to Website Redesign", STUB_HANDLERS)
 
         self.assertEqual(response["message"]["content"], _ADD_TASK_JSON)
         self.assertEqual(mock_post.call_count, 3)
@@ -164,7 +168,7 @@ class ToolCallLoopTests(SimpleTestCase):
             _make_response({"message": _final_msg(_ADD_TASK_JSON)}),
         ]
 
-        response, _ = chat("add a task", STUB_HANDLERS)
+        response, _, tool_trace = chat("add a task", STUB_HANDLERS)
 
         self.assertEqual(response["message"]["content"], _ADD_TASK_JSON)
         second_messages = mock_post.call_args_list[1][1]["json"]["messages"]
@@ -231,7 +235,7 @@ class ToolCallLoopTests(SimpleTestCase):
             "message": {"role": "assistant", "content": _NO_OP_JSON, "tool_calls": []},
         })
 
-        response, _ = chat("hello", STUB_HANDLERS)
+        response, _, tool_trace = chat("hello", STUB_HANDLERS)
 
         self.assertEqual(response["message"]["content"], _NO_OP_JSON)
         mock_post.assert_called_once()
@@ -242,7 +246,7 @@ class ToolCallLoopTests(SimpleTestCase):
         """Full round-trip: chat() then parse_llm_response() yields valid dict."""
         mock_post.return_value = _make_response({"message": _final_msg(_NO_OP_JSON)})
 
-        raw_response, _ = chat("hello", STUB_HANDLERS)
+        raw_response, _, tool_trace = chat("hello", STUB_HANDLERS)
         parsed = parse_llm_response(raw_response["message"]["content"])
 
         self.assertEqual(parsed["action"], "no_op")
@@ -291,16 +295,19 @@ class ToolCallLoopTests(SimpleTestCase):
             }),
         })
 
-        response, _ = chat("add a task", STUB_HANDLERS)
+        response, _, tool_trace = chat("add a task", STUB_HANDLERS)
         parsed = parse_llm_response(response["message"]["content"])
 
         self.assertEqual(parsed["action"], "add_task")
         self.assertEqual(parsed["data"]["project_name"], "Website Redesign")
         self.assertEqual(parsed["data"]["title"], "Write tests")
         self.assertEqual(parsed["message"], "Task added.")
-        # message must NOT appear in data
         self.assertNotIn("message", parsed["data"])
         mock_post.assert_called_once()
+        # Action tool appears in trace with result=None
+        self.assertEqual(len(tool_trace), 1)
+        self.assertEqual(tool_trace[0]["tool"], "add_task")
+        self.assertIsNone(tool_trace[0]["result"])
 
     # 14. Action tool in a batch terminates the loop immediately
     @patch("bot.ollama_client.requests.post")
@@ -316,7 +323,7 @@ class ToolCallLoopTests(SimpleTestCase):
         }
         mock_post.return_value = _make_response({"message": batched})
 
-        response, _ = chat("hello", STUB_HANDLERS)
+        response, _, tool_trace = chat("hello", STUB_HANDLERS)
         parsed = parse_llm_response(response["message"]["content"])
 
         self.assertEqual(parsed["action"], "no_op")
@@ -335,7 +342,7 @@ class ToolCallLoopTests(SimpleTestCase):
             }),
         })
 
-        response, _ = chat("mark task 3 as done", STUB_HANDLERS)
+        response, _, tool_trace = chat("mark task 3 as done", STUB_HANDLERS)
         parsed = parse_llm_response(response["message"]["content"])
 
         self.assertEqual(parsed["action"], "update_task")
@@ -357,7 +364,7 @@ class ToolCallLoopTests(SimpleTestCase):
             _make_response({"message": _final_msg(_NO_OP_JSON)}),
         ]
 
-        response, _ = chat("hello", STUB_HANDLERS)
+        response, _, tool_trace = chat("hello", STUB_HANDLERS)
 
         self.assertEqual(response["message"]["content"], _NO_OP_JSON)
         self.assertEqual(mock_post.call_count, 2)
@@ -377,7 +384,7 @@ class ToolCallLoopTests(SimpleTestCase):
             _make_response({"message": _final_msg(_NO_OP_JSON)}),
         ]
 
-        response, _ = chat("hello", STUB_HANDLERS)
+        response, _, tool_trace = chat("hello", STUB_HANDLERS)
 
         self.assertEqual(response["message"]["content"], _NO_OP_JSON)
         self.assertEqual(mock_post.call_count, 2)

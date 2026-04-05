@@ -70,7 +70,7 @@ class LLMResponseTests(TestCase):
             self.skipTest("Ollama is not running")
 
     def _ask(self, message: str) -> dict:
-        raw_response, _ = chat(message, SAMPLE_TOOL_HANDLERS)
+        raw_response, _, _ = chat(message, SAMPLE_TOOL_HANDLERS)
         raw_content = raw_response["message"]["content"]
         return parse_llm_response(raw_content)
 

@@ -212,7 +212,7 @@ def build_messages(user_message: str) -> list[dict]:
     ]
 
 
-def chat(user_message: str, tool_handlers: dict) -> tuple[dict, int]:
+def chat(user_message: str, tool_handlers: dict) -> tuple[dict, int, list[dict]]:
     """
     Run the tool-calling loop against Ollama /api/chat.
 
@@ -225,11 +225,17 @@ def chat(user_message: str, tool_handlers: dict) -> tuple[dict, int]:
       {"action", "data", "message"} JSON string and returned.
     - The model returns a non-empty text response (fallback path) → returned as-is.
 
-    Returns ({"message": {"content": "<JSON or text>"}}, elapsed_ms).
+    Returns ({"message": {"content": "<JSON or text>"}}, elapsed_ms, tool_trace).
+
+    tool_trace is a list of dicts recording every tool call made during the loop:
+      {"tool": name, "arguments": {...}, "result": "<JSON string or null>"}
+    Data tools carry the result string; action tools carry null (they are the
+    final action, not a data fetch).
     """
     messages = build_messages(user_message)
     start = time.monotonic()
     nudge_sent = False
+    tool_trace: list[dict] = []
 
     while True:
         try:
@@ -263,7 +269,7 @@ def chat(user_message: str, tool_handlers: dict) -> tuple[dict, int]:
                 messages.append({"role": "user", "content": "Please call an action tool to complete the request."})
                 continue
             elapsed_ms = int((time.monotonic() - start) * 1000)
-            return {"message": {"content": content}}, elapsed_ms
+            return {"message": {"content": content}}, elapsed_ms, tool_trace
 
         # Append the assistant's tool-call turn to the conversation
         messages.append({
@@ -282,9 +288,10 @@ def chat(user_message: str, tool_handlers: dict) -> tuple[dict, int]:
             if name in SUPPORTED_ACTIONS:
                 args = dict(arguments) if isinstance(arguments, dict) else {}
                 reply = args.pop("message", "")
+                tool_trace.append({"tool": name, "arguments": dict(arguments) if isinstance(arguments, dict) else {}, "result": None})
                 action_content = json.dumps({"action": name, "data": args, "message": reply})
                 elapsed_ms = int((time.monotonic() - start) * 1000)
-                return {"message": {"content": action_content}}, elapsed_ms
+                return {"message": {"content": action_content}}, elapsed_ms, tool_trace
 
             # Data tool: execute handler and feed result back
             handler = tool_handlers.get(name)
@@ -296,6 +303,7 @@ def chat(user_message: str, tool_handlers: dict) -> tuple[dict, int]:
             except Exception as e:
                 raise ToolCallError(f"Tool '{name}' raised an error: {e}")
 
+            tool_trace.append({"tool": name, "arguments": arguments, "result": result})
             messages.append({"role": "tool", "content": result})
 
 
