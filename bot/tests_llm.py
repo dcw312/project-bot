@@ -9,12 +9,15 @@ They are kept separate from bot/tests.py so the normal test suite stays fast.
 Tests are skipped automatically if Ollama is unreachable.
 """
 
+import json
+
 import requests
 from django.test import TestCase
 
 from bot.ollama_client import (
     LLMResponseParseError,
     OllamaUnavailableError,
+    ToolCallError,
     OLLAMA_BASE_URL,
     OLLAMA_MODEL,
     validate_ollama_startup,
@@ -31,14 +34,26 @@ def _ollama_available() -> bool:
         return False
 
 
-SAMPLE_CONTEXT = (
-    "User: david\n\n"
-    "Project: Miscellaneous\n"
-    "  - [todo] (id=1) Buy groceries (priority=3)\n\n"
-    "Project: Website Redesign\n"
-    "  - [todo] (id=2) Write homepage copy (priority=2)\n"
-    "  - [doing] (id=3) Design mockups (priority=1)\n"
-)
+# Stub tool handlers that return static fixture data.
+# The model will call these during the tool-call loop; responses are the same
+# fixture data that SAMPLE_CONTEXT previously injected into the prompt.
+SAMPLE_TOOL_HANDLERS = {
+    "get_projects": lambda **_: json.dumps([
+        {"id": 1, "name": "Miscellaneous", "description": ""},
+        {"id": 2, "name": "Website Redesign", "description": "Redesign the company website"},
+    ]),
+    "get_tasks": lambda project_name, **_: json.dumps({
+        "project": project_name,
+        "tasks": [
+            {"id": 1, "title": "Buy groceries", "status": "todo", "priority": 3, "due_date": None},
+            {"id": 2, "title": "Write homepage copy", "status": "todo", "priority": 2, "due_date": None},
+            {"id": 3, "title": "Design mockups", "status": "doing", "priority": 1, "due_date": None},
+        ],
+    }),
+    "search_tasks": lambda query, **_: json.dumps([
+        {"id": 2, "title": "Write homepage copy", "project": "Website Redesign", "status": "todo", "priority": 2},
+    ]),
+}
 
 
 class LLMResponseTests(TestCase):
@@ -55,7 +70,7 @@ class LLMResponseTests(TestCase):
             self.skipTest("Ollama is not running")
 
     def _ask(self, message: str) -> dict:
-        raw_response, _ = chat(message, SAMPLE_CONTEXT)
+        raw_response, _ = chat(message, SAMPLE_TOOL_HANDLERS)
         raw_content = raw_response["message"]["content"]
         return parse_llm_response(raw_content)
 
