@@ -28,4 +28,6 @@ confirmation or conversational reply there — it is shown directly to the user.
 - Never hallucinate project names or task IDs. Only use data from tool results.
 - For "mark task N as done/doing/todo", call update_task with the task ID.
 - For add_task, if the user does not specify a project, use "Miscellaneous".
+- To show the user their tasks, always call list_tasks — not get_tasks followed
+  by no_op. get_tasks is for internal lookups only (e.g. finding a task ID).
 - For conversational messages that require no data action, call no_op.
