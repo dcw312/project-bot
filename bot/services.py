@@ -1,3 +1,4 @@
+import json
 import os
 import time
 
@@ -165,6 +166,64 @@ def build_context_summary(user: DiscordUser) -> str:
     return '\n'.join(lines)
 
 
+def mcp_get_projects(user: DiscordUser) -> str:
+    """MCP tool: return the user's project list as a JSON string."""
+    projects = get_user_projects(user)
+    payload = [{"id": p.id, "name": p.name, "description": p.description or ""} for p in projects]
+    return json.dumps(payload)
+
+
+def mcp_get_tasks(user: DiscordUser, project_name: str) -> str:
+    """
+    MCP tool: return open tasks for a named project as a JSON string.
+
+    Uses case-insensitive contains match so partial names resolve correctly.
+    When multiple projects match, selects the one with the shortest name
+    (i.e. the most specific match). Returns an error JSON object if no
+    project is found.
+    """
+    project_ids = ProjectMember.objects.filter(user=user).values_list('project_id', flat=True)
+    projects = Project.objects.filter(id__in=project_ids, name__icontains=project_name)
+    if not projects.exists():
+        return json.dumps({"error": f"No project matching '{project_name}' found."})
+
+    project = min(projects, key=lambda p: len(p.name))
+
+    open_tasks = Task.objects.filter(project=project, status__in=[Task.TODO, Task.DOING])
+    payload = [
+        {
+            "id": t.id,
+            "title": t.title,
+            "status": t.status,
+            "priority": t.priority,
+            "due_date": t.due_date.isoformat() if t.due_date else None,
+        }
+        for t in open_tasks
+    ]
+    return json.dumps({"project": project.name, "tasks": payload})
+
+
+def mcp_search_tasks(user: DiscordUser, query: str) -> str:
+    """MCP tool: search task titles across all the user's projects."""
+    project_ids = ProjectMember.objects.filter(user=user).values_list('project_id', flat=True)
+    tasks = Task.objects.filter(
+        project_id__in=project_ids,
+        title__icontains=query,
+        status__in=[Task.TODO, Task.DOING],
+    ).select_related('project')
+    payload = [
+        {
+            "id": t.id,
+            "title": t.title,
+            "project": t.project.name,
+            "status": t.status,
+            "priority": t.priority,
+        }
+        for t in tasks
+    ]
+    return json.dumps(payload)
+
+
 def handle_llm_action(actor: DiscordUser, action_dict: dict, channel_id: str) -> str:
     action = action_dict['action']
     data = action_dict['data']
@@ -257,10 +316,14 @@ def process_message(discord_id: str, username: str, message_text: str, channel_i
     if not user.is_authorized:
         return None, False
 
-    context_summary = build_context_summary(user)
+    tool_handlers = {
+        "get_projects": lambda **_: mcp_get_projects(user),
+        "get_tasks": lambda project_name, **_: mcp_get_tasks(user, project_name),
+        "search_tasks": lambda query, **_: mcp_search_tasks(user, query),
+    }
 
     start = time.monotonic()
-    raw_response, elapsed_ms = ollama_client.chat(message_text, context_summary)
+    raw_response, elapsed_ms = ollama_client.chat(message_text, tool_handlers)
     raw_content = raw_response['message']['content']
 
     try:
