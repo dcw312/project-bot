@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import time
 from pathlib import Path
 
@@ -16,7 +17,8 @@ _system_prompt = None
 
 SUPPORTED_ACTIONS = {'create_project', 'add_task', 'update_task', 'list_tasks', 'no_op'}
 
-TOOL_DEFINITIONS = [
+# Data tools: called by the model to fetch information on demand.
+_DATA_TOOL_DEFINITIONS = [
     {
         "type": "function",
         "function": {
@@ -65,6 +67,108 @@ TOOL_DEFINITIONS = [
     },
 ]
 
+# Action tools: the model calls exactly one to complete each request.
+# chat() converts the tool call into the standard JSON action format so the
+# rest of the pipeline (parse_llm_response, handle_llm_action) is unchanged.
+_ACTION_TOOL_DEFINITIONS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "create_project",
+            "description": "Create a new project, optionally with starter tasks.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "description": {"type": "string"},
+                    "tasks": {
+                        "type": "array",
+                        "items": {"type": "object", "properties": {"title": {"type": "string"}}},
+                    },
+                    "message": {"type": "string", "description": "Confirmation to show the user."},
+                },
+                "required": ["name", "message"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "add_task",
+            "description": "Add a task to a project.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project_name": {"type": "string"},
+                    "title": {"type": "string"},
+                    "description": {"type": "string"},
+                    "priority": {"type": "integer", "description": "1 (highest) to 5 (lowest), default 3"},
+                    "due_date": {"type": "string", "description": "ISO8601 datetime, optional"},
+                    "deadline_type": {"type": "string", "description": "hard or soft, default soft"},
+                    "message": {"type": "string", "description": "Confirmation to show the user."},
+                },
+                "required": ["project_name", "title", "message"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_task",
+            "description": "Update one or more fields of an existing task.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "integer"},
+                    "fields": {
+                        "type": "object",
+                        "properties": {
+                            "status": {"type": "string", "description": "todo, doing, or done"},
+                            "priority": {"type": "integer"},
+                            "title": {"type": "string"},
+                            "due_date": {"type": "string"},
+                            "deadline_type": {"type": "string"},
+                        },
+                    },
+                    "message": {"type": "string", "description": "Confirmation to show the user."},
+                },
+                "required": ["task_id", "message"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_tasks",
+            "description": "List the user's tasks, optionally filtered by project.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project_name": {"type": "string", "description": "Optional project filter."},
+                    "message": {"type": "string", "description": "Intro message shown before the task list."},
+                },
+                "required": ["message"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "no_op",
+            "description": "No task or project action needed — reply conversationally.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message": {"type": "string", "description": "Conversational reply to show the user."},
+                },
+                "required": ["message"],
+            },
+        },
+    },
+]
+
+TOOL_DEFINITIONS = _DATA_TOOL_DEFINITIONS + _ACTION_TOOL_DEFINITIONS
+
 
 class OllamaUnavailableError(Exception):
     pass
@@ -112,14 +216,20 @@ def chat(user_message: str, tool_handlers: dict) -> tuple[dict, int]:
     """
     Run the tool-calling loop against Ollama /api/chat.
 
-    tool_handlers: mapping of tool name -> callable that accepts keyword
-                   arguments and returns a JSON string.
+    tool_handlers: mapping of data tool name -> callable returning a JSON string.
+                   Action tool names (SUPPORTED_ACTIONS) are handled internally
+                   and must NOT be included in tool_handlers.
 
-    Loops until the model stops issuing tool_calls, then returns
-    ({"message": {"content": "<JSON action string>"}}, elapsed_ms).
+    The loop runs until either:
+    - The model calls an action tool → arguments are converted to the standard
+      {"action", "data", "message"} JSON string and returned.
+    - The model returns a non-empty text response (fallback path) → returned as-is.
+
+    Returns ({"message": {"content": "<JSON or text>"}}, elapsed_ms).
     """
     messages = build_messages(user_message)
     start = time.monotonic()
+    nudge_sent = False
 
     while True:
         try:
@@ -142,9 +252,18 @@ def chat(user_message: str, tool_handlers: dict) -> tuple[dict, int]:
         tool_calls = assistant_message.get("tool_calls")
 
         if not tool_calls:
-            # No tool calls — this is the final response
+            content = assistant_message.get("content", "")
+            # Strip think tags to check if there is usable content
+            actual = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
+            if not actual and not nudge_sent:
+                # Model returned empty content (thinking may be in <think> tags).
+                # Append the turn and nudge once to get the action tool call.
+                nudge_sent = True
+                messages.append({"role": "assistant", "content": content})
+                messages.append({"role": "user", "content": "Please call an action tool to complete the request."})
+                continue
             elapsed_ms = int((time.monotonic() - start) * 1000)
-            return {"message": {"content": assistant_message.get("content", "")}}, elapsed_ms
+            return {"message": {"content": content}}, elapsed_ms
 
         # Append the assistant's tool-call turn to the conversation
         messages.append({
@@ -153,12 +272,21 @@ def chat(user_message: str, tool_handlers: dict) -> tuple[dict, int]:
             "tool_calls": tool_calls,
         })
 
-        # Execute each requested tool and append results
+        # Execute each requested tool; action tools terminate the loop immediately
         for tool_call in tool_calls:
             fn = tool_call.get("function", {})
             name = fn.get("name", "")
             arguments = fn.get("arguments", {})
 
+            # Action tool: convert arguments to the standard JSON action format
+            if name in SUPPORTED_ACTIONS:
+                args = dict(arguments) if isinstance(arguments, dict) else {}
+                reply = args.pop("message", "")
+                action_content = json.dumps({"action": name, "data": args, "message": reply})
+                elapsed_ms = int((time.monotonic() - start) * 1000)
+                return {"message": {"content": action_content}}, elapsed_ms
+
+            # Data tool: execute handler and feed result back
             handler = tool_handlers.get(name)
             if handler is None:
                 raise ToolCallError(f"Unknown tool requested by model: '{name}'")
@@ -173,23 +301,32 @@ def chat(user_message: str, tool_handlers: dict) -> tuple[dict, int]:
 
 def parse_llm_response(raw_content: str) -> dict:
     stripped = raw_content.strip()
-    if stripped.startswith('```'):
-        lines = stripped.splitlines()
-        # Remove opening fence (```json or ```)
-        lines = lines[1:]
-        # Remove closing fence
-        if lines and lines[-1].strip() == '```':
-            lines = lines[:-1]
-        stripped = '\n'.join(lines).strip()
+
+    if not stripped:
+        raise LLMResponseParseError("LLM returned an empty response.")
+
+    # Strip <think>...</think> blocks emitted by reasoning models (e.g. Qwen 3)
+    stripped = re.sub(r'<think>.*?</think>', '', stripped, flags=re.DOTALL).strip()
+
+    # Extract JSON from a code fence if present anywhere in the response.
+    # The model sometimes emits reasoning prose before the fence.
+    fence_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', stripped, re.DOTALL)
+    if fence_match:
+        stripped = fence_match.group(1).strip()
 
     try:
         parsed = json.loads(stripped)
     except json.JSONDecodeError as e:
         raise LLMResponseParseError(f"Failed to parse LLM JSON response: {e}\nContent: {raw_content!r}")
 
-    for key in ('action', 'data', 'message'):
+    for key in ('action', 'data'):
         if key not in parsed:
             raise LLMResponseParseError(f"LLM response missing required key '{key}': {parsed}")
+
+    # 'message' is required by the schema but default gracefully so a missing
+    # field never blocks a user-facing response.
+    if 'message' not in parsed:
+        parsed['message'] = ''
 
     if parsed['action'] not in SUPPORTED_ACTIONS:
         raise LLMResponseParseError(

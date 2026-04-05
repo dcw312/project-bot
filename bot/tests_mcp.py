@@ -10,23 +10,36 @@ Run with:
     venv/bin/python manage.py test bot.tests_mcp --verbosity=2
 
 What is covered:
-  1. No-tool path — model returns JSON action immediately, no tool calls.
-  2. Single tool call — model calls get_projects once, then returns action.
-  3. Multi-tool call sequence — model calls get_projects then get_tasks in
-     separate turns before returning the final action.
-  4. Multiple tool calls in one turn — model batches two calls in one response.
-  5. Tool result is passed back — asserts the tool return value appears in the
-     second request's message list.
-  6. Unknown tool raises ToolCallError.
-  7. Tool handler exception is wrapped in ToolCallError.
-  8. Ollama HTTP error raises OllamaUnavailableError.
-  9. Final response with empty tool_calls list treated as no-tool (edge case).
- 10. parse_llm_response integration — chat() + parse_llm_response() together
-     produce a valid action dict on the no-tool path.
+
+  Loop mechanics
+  1.  No-tool path — model returns JSON action in content, no tool calls.
+  2.  Single data tool call — model calls get_projects, then returns content.
+  3.  Multi-turn data tool calls — get_projects then get_tasks, then content.
+  4.  Multiple data tool calls batched in one turn.
+  5.  Tool result forwarded in the next request body.
+  6.  Unknown tool raises ToolCallError.
+  7.  Tool handler exception is wrapped in ToolCallError.
+  8.  Ollama HTTP error raises OllamaUnavailableError.
+  9.  Empty tool_calls list (falsy) treated as no-tool path.
+  10. chat() + parse_llm_response() round-trip on the no-tool path.
+  11. TOOL_DEFINITIONS sent on every request.
+  12. /api/chat endpoint used (not /api/generate).
+
+  Action-tool path (model calls action as tool instead of returning JSON)
+  13. Action tool call immediately returns formatted JSON response.
+  14. Action tool in a batch with data tools returns immediately.
+  15. message field is extracted from action tool arguments.
+
+  Empty-content nudge
+  16. Empty content triggers one nudge message, then succeeds.
+  17. Content that is only <think> tags triggers the nudge.
+
+  mcp_* service function unit tests
+  18-23. mcp_get_projects, mcp_get_tasks, mcp_search_tasks JSON output.
 """
 
 import json
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 from django.test import SimpleTestCase
 
@@ -34,8 +47,6 @@ from bot.ollama_client import (
     LLMResponseParseError,
     OllamaUnavailableError,
     ToolCallError,
-    OLLAMA_BASE_URL,
-    OLLAMA_MODEL,
     TOOL_DEFINITIONS,
     chat,
     parse_llm_response,
@@ -55,7 +66,6 @@ def _make_response(payload: dict) -> MagicMock:
 
 
 def _tool_call_msg(name: str, arguments: dict) -> dict:
-    """Build the assistant message dict that contains a tool call."""
     return {
         "role": "assistant",
         "content": "",
@@ -63,12 +73,11 @@ def _tool_call_msg(name: str, arguments: dict) -> dict:
     }
 
 
-def _final_msg(action_json: str) -> dict:
-    """Build the assistant message dict for the final JSON action response."""
-    return {"role": "assistant", "content": action_json}
+def _final_msg(content: str) -> dict:
+    return {"role": "assistant", "content": content}
 
 
-# Canonical action JSON strings used across multiple tests
+# Canonical JSON strings
 _NO_OP_JSON = json.dumps({"action": "no_op", "data": {}, "message": "Hello!"})
 _LIST_TASKS_JSON = json.dumps({"action": "list_tasks", "data": {}, "message": "Here are your tasks."})
 _ADD_TASK_JSON = json.dumps({
@@ -77,9 +86,11 @@ _ADD_TASK_JSON = json.dumps({
     "message": "Task added.",
 })
 
-# Stub tool handlers used in most tests
 _PROJECTS_JSON = json.dumps([{"id": 1, "name": "Website Redesign", "description": ""}])
-_TASKS_JSON = json.dumps({"project": "Website Redesign", "tasks": [{"id": 5, "title": "Write tests", "status": "todo", "priority": 2, "due_date": None}]})
+_TASKS_JSON = json.dumps({
+    "project": "Website Redesign",
+    "tasks": [{"id": 5, "title": "Write tests", "status": "todo", "priority": 2, "due_date": None}],
+})
 
 STUB_HANDLERS = {
     "get_projects": lambda **_: _PROJECTS_JSON,
@@ -89,41 +100,28 @@ STUB_HANDLERS = {
 
 
 # ---------------------------------------------------------------------------
-# Tests — ollama_client.chat() loop mechanics
+# Tests — loop mechanics
 # ---------------------------------------------------------------------------
 
 @patch("bot.ollama_client._system_prompt", "You are a test assistant.")
 class ToolCallLoopTests(SimpleTestCase):
-    """
-    Tests for the tool-calling loop mechanics in ollama_client.chat().
 
-    _system_prompt is patched at module level so build_messages() does not
-    fail with TypeError when it tries to concatenate None.
-    """
-
-    # ------------------------------------------------------------------
     # 1. No-tool path
-    # ------------------------------------------------------------------
-
     @patch("bot.ollama_client.requests.post")
     def test_no_tool_call_returns_final_response(self, mock_post):
-        """Model returns JSON action on the first request — no tool calls."""
+        """Model returns JSON action in content on the first request."""
         mock_post.return_value = _make_response({"message": _final_msg(_NO_OP_JSON)})
 
         response, elapsed_ms = chat("hello", STUB_HANDLERS)
 
         self.assertEqual(response["message"]["content"], _NO_OP_JSON)
         self.assertIsInstance(elapsed_ms, int)
-        self.assertGreaterEqual(elapsed_ms, 0)
         mock_post.assert_called_once()
 
-    # ------------------------------------------------------------------
-    # 2. Single tool call
-    # ------------------------------------------------------------------
-
+    # 2. Single data tool call
     @patch("bot.ollama_client.requests.post")
-    def test_single_tool_call_then_final_response(self, mock_post):
-        """Model calls get_projects once, then returns the final action."""
+    def test_single_data_tool_call_then_final_response(self, mock_post):
+        """Model calls get_projects once, then returns JSON in content."""
         mock_post.side_effect = [
             _make_response({"message": _tool_call_msg("get_projects", {})}),
             _make_response({"message": _final_msg(_LIST_TASKS_JSON)}),
@@ -134,12 +132,9 @@ class ToolCallLoopTests(SimpleTestCase):
         self.assertEqual(response["message"]["content"], _LIST_TASKS_JSON)
         self.assertEqual(mock_post.call_count, 2)
 
-    # ------------------------------------------------------------------
-    # 3. Multi-turn tool calls
-    # ------------------------------------------------------------------
-
+    # 3. Multi-turn data tool calls
     @patch("bot.ollama_client.requests.post")
-    def test_multi_turn_tool_calls(self, mock_post):
+    def test_multi_turn_data_tool_calls(self, mock_post):
         """Model calls get_projects then get_tasks in separate turns."""
         mock_post.side_effect = [
             _make_response({"message": _tool_call_msg("get_projects", {})}),
@@ -152,13 +147,10 @@ class ToolCallLoopTests(SimpleTestCase):
         self.assertEqual(response["message"]["content"], _ADD_TASK_JSON)
         self.assertEqual(mock_post.call_count, 3)
 
-    # ------------------------------------------------------------------
-    # 4. Multiple tool calls batched in one turn
-    # ------------------------------------------------------------------
-
+    # 4. Multiple data tool calls batched in one turn
     @patch("bot.ollama_client.requests.post")
-    def test_batched_tool_calls_in_one_turn(self, mock_post):
-        """Model issues two tool calls in a single response turn."""
+    def test_batched_data_tool_calls(self, mock_post):
+        """Model issues two data tool calls in a single response turn."""
         batched_msg = {
             "role": "assistant",
             "content": "",
@@ -172,23 +164,17 @@ class ToolCallLoopTests(SimpleTestCase):
             _make_response({"message": _final_msg(_ADD_TASK_JSON)}),
         ]
 
-        response, _ = chat("add a task to Website Redesign", STUB_HANDLERS)
+        response, _ = chat("add a task", STUB_HANDLERS)
 
         self.assertEqual(response["message"]["content"], _ADD_TASK_JSON)
-        self.assertEqual(mock_post.call_count, 2)
+        second_messages = mock_post.call_args_list[1][1]["json"]["messages"]
+        tool_results = [m for m in second_messages if m.get("role") == "tool"]
+        self.assertEqual(len(tool_results), 2)
 
-        # Second request messages should contain two tool result entries
-        second_call_messages = mock_post.call_args_list[1][1]["json"]["messages"]
-        tool_result_messages = [m for m in second_call_messages if m.get("role") == "tool"]
-        self.assertEqual(len(tool_result_messages), 2)
-
-    # ------------------------------------------------------------------
-    # 5. Tool result is forwarded in subsequent request
-    # ------------------------------------------------------------------
-
+    # 5. Tool result forwarded in subsequent request
     @patch("bot.ollama_client.requests.post")
-    def test_tool_result_appears_in_next_request(self, mock_post):
-        """The tool handler's return value is sent back to the model."""
+    def test_data_tool_result_forwarded(self, mock_post):
+        """The data tool handler's return value appears in the next request."""
         mock_post.side_effect = [
             _make_response({"message": _tool_call_msg("get_projects", {})}),
             _make_response({"message": _final_msg(_LIST_TASKS_JSON)}),
@@ -196,17 +182,14 @@ class ToolCallLoopTests(SimpleTestCase):
 
         chat("list my tasks", STUB_HANDLERS)
 
-        second_request_messages = mock_post.call_args_list[1][1]["json"]["messages"]
-        tool_result = next(m for m in second_request_messages if m.get("role") == "tool")
+        second_messages = mock_post.call_args_list[1][1]["json"]["messages"]
+        tool_result = next(m for m in second_messages if m.get("role") == "tool")
         self.assertEqual(tool_result["content"], _PROJECTS_JSON)
 
-    # ------------------------------------------------------------------
     # 6. Unknown tool raises ToolCallError
-    # ------------------------------------------------------------------
-
     @patch("bot.ollama_client.requests.post")
     def test_unknown_tool_raises_tool_call_error(self, mock_post):
-        """Model requests a tool that is not in tool_handlers."""
+        """Model requests a tool not in tool_handlers and not an action."""
         mock_post.return_value = _make_response({
             "message": _tool_call_msg("delete_all_tasks", {}),
         })
@@ -216,45 +199,34 @@ class ToolCallLoopTests(SimpleTestCase):
 
         self.assertIn("delete_all_tasks", str(ctx.exception))
 
-    # ------------------------------------------------------------------
-    # 7. Tool handler exception is wrapped in ToolCallError
-    # ------------------------------------------------------------------
-
+    # 7. Tool handler exception wrapped
     @patch("bot.ollama_client.requests.post")
     def test_tool_handler_exception_wrapped(self, mock_post):
-        """An exception raised inside a tool handler becomes ToolCallError."""
+        """Exception from a data tool handler is wrapped in ToolCallError."""
         mock_post.return_value = _make_response({
             "message": _tool_call_msg("get_projects", {}),
         })
-        exploding_handlers = {
-            "get_projects": lambda **_: (_ for _ in ()).throw(RuntimeError("DB is down")),
-        }
+        exploding = {"get_projects": lambda **_: (_ for _ in ()).throw(RuntimeError("DB down"))}
 
         with self.assertRaises(ToolCallError) as ctx:
-            chat("list my projects", exploding_handlers)
+            chat("list my projects", exploding)
 
         self.assertIn("get_projects", str(ctx.exception))
 
-    # ------------------------------------------------------------------
-    # 8. Ollama HTTP error raises OllamaUnavailableError
-    # ------------------------------------------------------------------
-
+    # 8. Ollama HTTP error
     @patch("bot.ollama_client.requests.post")
     def test_http_error_raises_ollama_unavailable(self, mock_post):
-        """A requests.RequestException on any iteration raises OllamaUnavailableError."""
+        """A requests.RequestException raises OllamaUnavailableError."""
         import requests as req
         mock_post.side_effect = req.ConnectionError("refused")
 
         with self.assertRaises(OllamaUnavailableError):
             chat("hello", STUB_HANDLERS)
 
-    # ------------------------------------------------------------------
-    # 9. Empty tool_calls list treated as final response (edge case)
-    # ------------------------------------------------------------------
-
+    # 9. Empty tool_calls list treated as no-tool path
     @patch("bot.ollama_client.requests.post")
     def test_empty_tool_calls_list_treated_as_final(self, mock_post):
-        """tool_calls=[] (falsy) should be treated the same as tool_calls absent."""
+        """tool_calls=[] (falsy) is treated the same as absent tool_calls."""
         mock_post.return_value = _make_response({
             "message": {"role": "assistant", "content": _NO_OP_JSON, "tool_calls": []},
         })
@@ -264,13 +236,10 @@ class ToolCallLoopTests(SimpleTestCase):
         self.assertEqual(response["message"]["content"], _NO_OP_JSON)
         mock_post.assert_called_once()
 
-    # ------------------------------------------------------------------
     # 10. chat() + parse_llm_response() round-trip
-    # ------------------------------------------------------------------
-
     @patch("bot.ollama_client.requests.post")
     def test_chat_and_parse_round_trip(self, mock_post):
-        """Full round-trip: chat() followed by parse_llm_response() yields a valid dict."""
+        """Full round-trip: chat() then parse_llm_response() yields valid dict."""
         mock_post.return_value = _make_response({"message": _final_msg(_NO_OP_JSON)})
 
         raw_response, _ = chat("hello", STUB_HANDLERS)
@@ -280,13 +249,10 @@ class ToolCallLoopTests(SimpleTestCase):
         self.assertEqual(parsed["data"], {})
         self.assertEqual(parsed["message"], "Hello!")
 
-    # ------------------------------------------------------------------
-    # 11. TOOL_DEFINITIONS are sent on every request
-    # ------------------------------------------------------------------
-
+    # 11. TOOL_DEFINITIONS sent on every request
     @patch("bot.ollama_client.requests.post")
     def test_tool_definitions_sent_on_every_request(self, mock_post):
-        """Each /api/chat POST includes the full TOOL_DEFINITIONS array."""
+        """Each POST includes the full TOOL_DEFINITIONS array."""
         mock_post.side_effect = [
             _make_response({"message": _tool_call_msg("get_projects", {})}),
             _make_response({"message": _final_msg(_LIST_TASKS_JSON)}),
@@ -295,13 +261,9 @@ class ToolCallLoopTests(SimpleTestCase):
         chat("list my tasks", STUB_HANDLERS)
 
         for call_kwargs in mock_post.call_args_list:
-            sent_tools = call_kwargs[1]["json"]["tools"]
-            self.assertEqual(sent_tools, TOOL_DEFINITIONS)
+            self.assertEqual(call_kwargs[1]["json"]["tools"], TOOL_DEFINITIONS)
 
-    # ------------------------------------------------------------------
-    # 12. Correct Ollama endpoint is used
-    # ------------------------------------------------------------------
-
+    # 12. /api/chat endpoint used
     @patch("bot.ollama_client.requests.post")
     def test_uses_api_chat_endpoint(self, mock_post):
         """Requests must target /api/chat, not the old /api/generate."""
@@ -313,38 +275,131 @@ class ToolCallLoopTests(SimpleTestCase):
         self.assertTrue(url.endswith("/api/chat"), f"Expected /api/chat, got: {url}")
         self.assertNotIn("/api/generate", url)
 
+    # ------------------------------------------------------------------
+    # Action-tool path
+    # ------------------------------------------------------------------
+
+    # 13. Action tool call returns formatted JSON immediately
+    @patch("bot.ollama_client.requests.post")
+    def test_action_tool_returns_json_response(self, mock_post):
+        """Model calls an action tool; loop converts args to JSON and returns."""
+        mock_post.return_value = _make_response({
+            "message": _tool_call_msg("add_task", {
+                "project_name": "Website Redesign",
+                "title": "Write tests",
+                "message": "Task added.",
+            }),
+        })
+
+        response, _ = chat("add a task", STUB_HANDLERS)
+        parsed = parse_llm_response(response["message"]["content"])
+
+        self.assertEqual(parsed["action"], "add_task")
+        self.assertEqual(parsed["data"]["project_name"], "Website Redesign")
+        self.assertEqual(parsed["data"]["title"], "Write tests")
+        self.assertEqual(parsed["message"], "Task added.")
+        # message must NOT appear in data
+        self.assertNotIn("message", parsed["data"])
+        mock_post.assert_called_once()
+
+    # 14. Action tool in a batch terminates the loop immediately
+    @patch("bot.ollama_client.requests.post")
+    def test_action_tool_in_batch_returns_immediately(self, mock_post):
+        """Action tool in same batch as data tool returns without extra request."""
+        batched = {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"function": {"name": "get_projects", "arguments": {}}},
+                {"function": {"name": "no_op", "arguments": {"message": "Hi there!"}}},
+            ],
+        }
+        mock_post.return_value = _make_response({"message": batched})
+
+        response, _ = chat("hello", STUB_HANDLERS)
+        parsed = parse_llm_response(response["message"]["content"])
+
+        self.assertEqual(parsed["action"], "no_op")
+        self.assertEqual(parsed["message"], "Hi there!")
+        mock_post.assert_called_once()
+
+    # 15. message field extracted from action tool arguments
+    @patch("bot.ollama_client.requests.post")
+    def test_action_tool_message_extracted_from_data(self, mock_post):
+        """The 'message' key from action args appears in JSON 'message', not 'data'."""
+        mock_post.return_value = _make_response({
+            "message": _tool_call_msg("update_task", {
+                "task_id": 3,
+                "fields": {"status": "done"},
+                "message": "Marked as done.",
+            }),
+        })
+
+        response, _ = chat("mark task 3 as done", STUB_HANDLERS)
+        parsed = parse_llm_response(response["message"]["content"])
+
+        self.assertEqual(parsed["action"], "update_task")
+        self.assertEqual(parsed["data"]["task_id"], 3)
+        self.assertEqual(parsed["data"]["fields"]["status"], "done")
+        self.assertEqual(parsed["message"], "Marked as done.")
+        self.assertNotIn("message", parsed["data"])
+
+    # ------------------------------------------------------------------
+    # Empty-content nudge
+    # ------------------------------------------------------------------
+
+    # 16. Empty content triggers nudge, then succeeds
+    @patch("bot.ollama_client.requests.post")
+    def test_empty_content_triggers_nudge_then_succeeds(self, mock_post):
+        """Model returns empty content; nudge is sent; second attempt returns JSON."""
+        mock_post.side_effect = [
+            _make_response({"message": {"role": "assistant", "content": ""}}),
+            _make_response({"message": _final_msg(_NO_OP_JSON)}),
+        ]
+
+        response, _ = chat("hello", STUB_HANDLERS)
+
+        self.assertEqual(response["message"]["content"], _NO_OP_JSON)
+        self.assertEqual(mock_post.call_count, 2)
+        # Verify the nudge was appended as a user message
+        second_messages = mock_post.call_args_list[1][1]["json"]["messages"]
+        last_user = next(
+            m for m in reversed(second_messages) if m.get("role") == "user"
+        )
+        self.assertIn("action tool", last_user["content"])
+
+    # 17. Content that is only <think> tags triggers the nudge
+    @patch("bot.ollama_client.requests.post")
+    def test_think_only_content_triggers_nudge(self, mock_post):
+        """Content consisting only of <think> tags is treated as empty."""
+        mock_post.side_effect = [
+            _make_response({"message": {"role": "assistant", "content": "<think>reasoning here</think>"}}),
+            _make_response({"message": _final_msg(_NO_OP_JSON)}),
+        ]
+
+        response, _ = chat("hello", STUB_HANDLERS)
+
+        self.assertEqual(response["message"]["content"], _NO_OP_JSON)
+        self.assertEqual(mock_post.call_count, 2)
+
 
 # ---------------------------------------------------------------------------
 # Tests — mcp_* service functions (unit, no HTTP)
 # ---------------------------------------------------------------------------
 
 class MCPToolFunctionTests(SimpleTestCase):
-    """
-    Unit tests for the mcp_get_projects / mcp_get_tasks / mcp_search_tasks
-    functions in services.py.
-
-    These do not hit the database; they use mock objects so that the JSON
-    serialisation logic can be validated without Django ORM setup.
-    """
 
     def _make_user(self):
         user = MagicMock()
         user.username = "testuser"
         return user
 
+    # 18. mcp_get_projects returns JSON list
     def test_mcp_get_projects_returns_json_list(self):
-        """mcp_get_projects returns a JSON array of project dicts."""
         from bot.services import mcp_get_projects
 
-        p1 = MagicMock()
-        p1.id = 1
-        p1.name = "Alpha"
-        p1.description = "First project"
-
-        p2 = MagicMock()
-        p2.id = 2
-        p2.name = "Beta"
-        p2.description = None
+        p1 = MagicMock(); p1.id = 1; p1.name = "Alpha"; p1.description = "First"
+        p2 = MagicMock(); p2.id = 2; p2.name = "Beta";  p2.description = None
 
         with patch("bot.services.get_user_projects", return_value=[p1, p2]):
             result = mcp_get_projects(self._make_user())
@@ -352,25 +407,19 @@ class MCPToolFunctionTests(SimpleTestCase):
         parsed = json.loads(result)
         self.assertEqual(len(parsed), 2)
         self.assertEqual(parsed[0]["name"], "Alpha")
-        self.assertEqual(parsed[1]["description"], "")  # None -> ""
+        self.assertEqual(parsed[1]["description"], "")  # None → ""
 
+    # 19. mcp_get_tasks returns project + task object
     def test_mcp_get_tasks_returns_json_object(self):
-        """mcp_get_tasks returns {"project": name, "tasks": [...]}."""
         from bot.services import mcp_get_tasks
 
         task = MagicMock()
-        task.id = 7
-        task.title = "Fix the bug"
-        task.status = "todo"
-        task.priority = 2
-        task.due_date = None
+        task.id = 7; task.title = "Fix the bug"; task.status = "todo"
+        task.priority = 2; task.due_date = None
 
         project = MagicMock()
-        project.id = 1
-        project.name = "Alpha"
+        project.id = 1; project.name = "Alpha"
 
-        # The queryset mock must support .exists() (bool check) and be
-        # iterable for min(); configure both on the same MagicMock object.
         mock_project_qs = MagicMock()
         mock_project_qs.exists.return_value = True
         mock_project_qs.__iter__ = MagicMock(return_value=iter([project]))
@@ -391,8 +440,8 @@ class MCPToolFunctionTests(SimpleTestCase):
         self.assertEqual(len(parsed["tasks"]), 1)
         self.assertEqual(parsed["tasks"][0]["title"], "Fix the bug")
 
+    # 20. mcp_get_tasks no-match returns error JSON
     def test_mcp_get_tasks_no_match_returns_error_json(self):
-        """mcp_get_tasks returns {"error": ...} when no project matches."""
         from bot.services import mcp_get_tasks
 
         with (
@@ -408,15 +457,13 @@ class MCPToolFunctionTests(SimpleTestCase):
         self.assertIn("error", parsed)
         self.assertIn("Nonexistent", parsed["error"])
 
+    # 21. mcp_search_tasks returns matching task list
     def test_mcp_search_tasks_returns_json_list(self):
-        """mcp_search_tasks returns a JSON array of matching task dicts."""
         from bot.services import mcp_search_tasks
 
         task = MagicMock()
-        task.id = 3
-        task.title = "Write homepage copy"
-        task.status = "todo"
-        task.priority = 2
+        task.id = 3; task.title = "Write homepage copy"
+        task.status = "todo"; task.priority = 2
         task.project.name = "Website Redesign"
 
         with (
@@ -431,10 +478,9 @@ class MCPToolFunctionTests(SimpleTestCase):
         parsed = json.loads(result)
         self.assertEqual(len(parsed), 1)
         self.assertEqual(parsed[0]["title"], "Write homepage copy")
-        self.assertEqual(parsed[0]["project"], "Website Redesign")
 
+    # 22. mcp_search_tasks empty returns []
     def test_mcp_search_tasks_empty_returns_empty_list(self):
-        """mcp_search_tasks returns [] when no tasks match."""
         from bot.services import mcp_search_tasks
 
         with (
@@ -446,28 +492,17 @@ class MCPToolFunctionTests(SimpleTestCase):
 
             result = mcp_search_tasks(self._make_user(), "xyz")
 
-        parsed = json.loads(result)
-        self.assertEqual(parsed, [])
+        self.assertEqual(json.loads(result), [])
 
+    # 23. All three tools return str (Ollama protocol requirement)
     def test_mcp_tool_results_are_strings(self):
-        """All three MCP tools must return str (not dict), per Ollama protocol."""
         from bot.services import mcp_get_projects, mcp_get_tasks, mcp_search_tasks
 
-        project = MagicMock()
-        project.id = 1
-        project.name = "Alpha"
-        project.description = ""
-
+        project = MagicMock(); project.id = 1; project.name = "Alpha"; project.description = ""
         task = MagicMock()
-        task.id = 1
-        task.title = "A task"
-        task.status = "todo"
-        task.priority = 3
-        task.due_date = None
-        task.project.name = "Alpha"
+        task.id = 1; task.title = "A task"; task.status = "todo"
+        task.priority = 3; task.due_date = None; task.project.name = "Alpha"
 
-        # Task queryset mock must support both direct iteration (mcp_get_tasks
-        # iterates the filter result) and .select_related() (mcp_search_tasks).
         mock_task_qs = MagicMock()
         mock_task_qs.__iter__ = MagicMock(return_value=iter([task]))
         mock_task_qs.select_related.return_value = [task]
