@@ -16,12 +16,66 @@ _system_prompt = None
 
 SUPPORTED_ACTIONS = {'create_project', 'add_task', 'update_task', 'list_tasks', 'no_op'}
 
+TOOL_DEFINITIONS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_projects",
+            "description": "Return the list of projects the user is a member of.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_tasks",
+            "description": "Return open tasks for a named project.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project_name": {
+                        "type": "string",
+                        "description": "The name of the project to fetch tasks for.",
+                    },
+                },
+                "required": ["project_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_tasks",
+            "description": "Search task titles across all the user's projects.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Keyword or phrase to search for in task titles.",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+]
+
 
 class OllamaUnavailableError(Exception):
     pass
 
 
 class LLMResponseParseError(Exception):
+    pass
+
+
+class ToolCallError(Exception):
+    """Raised when the model requests an unknown tool or a tool handler raises."""
     pass
 
 
@@ -47,34 +101,74 @@ def validate_ollama_startup():
     _system_prompt = SYSTEM_PROMPT_PATH.read_text(encoding='utf-8')
 
 
-def build_prompt(user_message: str, context_summary: str) -> str:
-    return (
-        _system_prompt
-        + "\n\n## Current context\n"
-        + context_summary
-        + "\n\nUser: "
-        + user_message
-        + "\nAssistant:"
-    )
+def build_messages(user_message: str) -> list[dict]:
+    return [
+        {"role": "system", "content": _system_prompt},
+        {"role": "user", "content": user_message},
+    ]
 
 
-def chat(user_message: str, context_summary: str) -> tuple[dict, int]:
-    prompt = build_prompt(user_message, context_summary)
+def chat(user_message: str, tool_handlers: dict) -> tuple[dict, int]:
+    """
+    Run the tool-calling loop against Ollama /api/chat.
+
+    tool_handlers: mapping of tool name -> callable that accepts keyword
+                   arguments and returns a JSON string.
+
+    Loops until the model stops issuing tool_calls, then returns
+    ({"message": {"content": "<JSON action string>"}}, elapsed_ms).
+    """
+    messages = build_messages(user_message)
     start = time.monotonic()
-    try:
-        response = requests.post(
-            f"{OLLAMA_BASE_URL}/api/generate",
-            json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False},
-            timeout=120,
-        )
-        response.raise_for_status()
-    except requests.RequestException as e:
-        raise OllamaUnavailableError(f"Ollama request failed: {e}")
 
-    elapsed_ms = int((time.monotonic() - start) * 1000)
-    # Normalise generate response to match the shape services.py expects
-    data = response.json()
-    return {"message": {"content": data.get("response", "")}}, elapsed_ms
+    while True:
+        try:
+            response = requests.post(
+                f"{OLLAMA_BASE_URL}/api/chat",
+                json={
+                    "model": OLLAMA_MODEL,
+                    "messages": messages,
+                    "tools": TOOL_DEFINITIONS,
+                    "stream": False,
+                },
+                timeout=120,
+            )
+            response.raise_for_status()
+        except requests.RequestException as e:
+            raise OllamaUnavailableError(f"Ollama request failed: {e}")
+
+        data = response.json()
+        assistant_message = data.get("message", {})
+        tool_calls = assistant_message.get("tool_calls")
+
+        if not tool_calls:
+            # No tool calls — this is the final response
+            elapsed_ms = int((time.monotonic() - start) * 1000)
+            return {"message": {"content": assistant_message.get("content", "")}}, elapsed_ms
+
+        # Append the assistant's tool-call turn to the conversation
+        messages.append({
+            "role": "assistant",
+            "content": assistant_message.get("content", ""),
+            "tool_calls": tool_calls,
+        })
+
+        # Execute each requested tool and append results
+        for tool_call in tool_calls:
+            fn = tool_call.get("function", {})
+            name = fn.get("name", "")
+            arguments = fn.get("arguments", {})
+
+            handler = tool_handlers.get(name)
+            if handler is None:
+                raise ToolCallError(f"Unknown tool requested by model: '{name}'")
+
+            try:
+                result = handler(**arguments)
+            except Exception as e:
+                raise ToolCallError(f"Tool '{name}' raised an error: {e}")
+
+            messages.append({"role": "tool", "content": result})
 
 
 def parse_llm_response(raw_content: str) -> dict:
